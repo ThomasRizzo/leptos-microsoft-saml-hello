@@ -1,50 +1,39 @@
-# Leptos + Trunk + Microsoft SAML Hello World
-# Run with: just <recipe>
+# Leptos + Jama Explorer - just commands
 
-set shell := ["bash", "-c"]
-set dotenv-load := false
-
-default:
-    @just --list
-
-# Install required tools (run once)
+# One-time setup
 install-tools:
-    cargo install trunk leptosfmt
+    cargo install trunk
     rustup target add wasm32-unknown-unknown
-    @echo "✅ Tools installed. You may also want: cargo install cargo-leptos (for SSR later)"
 
-# Development server with hot reload
+# Development
 serve:
     trunk serve --port 3000 --open
 
-# Build for production (outputs to dist/)
+# Production build
 build:
     trunk build --release
 
-# Check / lint
+# Check without building WASM
 check:
     cargo check --target wasm32-unknown-unknown
 
 # Format code
 fmt:
-    leptosfmt .
     cargo fmt
 
 # Clean build artifacts
 clean:
+    trunk clean
     cargo clean
-    rm -rf dist/
 
-# Update dependencies
-update:
-    cargo update
+# Fresh start (clean + reinstall tools + serve)
+fresh:
+    just clean
+    just install-tools
+    just serve
 
-# Full clean + install + serve (fresh start)
-fresh: clean install-tools serve
-
-# Show current config (useful for debugging)
+# Show versions
 info:
-    @echo "Rust version: $(rustc --version)"
-    @echo "Cargo version: $(cargo --version)"
-    @echo "Trunk version: $(trunk --version 2>/dev/null || echo 'not installed')"
-    @echo "Target: wasm32-unknown-unknown"
+    @echo "Rust: $(rustc --version)"
+    @echo "Cargo: $(cargo --version)"
+    @echo "Trunk: $(trunk --version 2>/dev/null || echo 'not installed')"

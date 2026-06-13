@@ -1,32 +1,7 @@
-# Rust
 /target
+/dist
 **/*.rs.bk
 Cargo.lock
-
-# Trunk / WASM build output
-/dist
-**/*.wasm
-**/*.js
-**/*.ts
-trunk-*.log
-
-# IDE / editors
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Env / secrets (never commit real tenant IDs)
 .env
-.env.*
-*.pem
-*.key
-
-# Leptos / cargo-leptos (if you switch later)
-pkg/
-site/
+*.log
+.DS_Store

@@ -1,100 +1,84 @@
-# Leptos + Trunk + Microsoft SAML Hello World
+# Leptos + Jama Connect REST API Explorer
 
-A minimal "Hello World" sample application demonstrating:
+A clean, modern Leptos 0.8 (CSR + WASM) demo that lets you:
 
-- **Leptos** reactive UI compiled to WebAssembly (WASM)
-- **Trunk** for building/bundling/serving the CSR (Client-Side Rendered) app
-- **Microsoft Entra ID (Azure AD) SAML 2.0** authentication flow (SP-initiated redirect)
-- Display of user information after authentication
+- Paste an existing bearer token, **or**
+- Enter Client ID + Client Secret to automatically fetch a fresh OAuth token from Jama
+- Fetch and display your list of projects from the Jama REST API
 
-This is a **frontend-only demo**. For production use with real SAML, you should add a thin Rust backend (e.g. Axum) to securely handle the SAML Assertion Consumer Service (ACS) endpoint, validate the SAMLResponse (signatures, conditions, replay protection), and issue a secure session token (JWT) that the Leptos app consumes.
+## Features
 
-## Prerequisites
-
-- Rust (stable or nightly recommended for Leptos)
-- `cargo install trunk`
-- `rustup target add wasm32-unknown-unknown`
-- (Optional) `cargo install leptosfmt` for formatting
+- Two authentication modes in one UI
+- Clean Tailwind + heroicons styling
+- Proper error handling and loading states
+- Works entirely in the browser (client-side)
 
 ## Quick Start
 
 ```bash
-cd leptos-microsoft-saml-hello
+# 1. Install tools (first time only)
+just install-tools
 
-# Development server with hot reload
-trunk serve --port 3000 --open
+# 2. Run the dev server
+just serve
 ```
 
 Then open http://localhost:3000
 
+## How to get your Jama credentials
+
+### Option 1: Use an existing token (easiest for testing)
+1. Log into Jama Connect
+2. Go to your profile → **Set API Credentials** (or Admin area)
+3. Generate or copy an access token if available, or use a session token for testing.
+
+### Option 2: Client Credentials flow (recommended)
+1. In Jama, go to your user profile → **Set API Credentials**
+2. Create a new set of **Client ID + Client Secret**
+3. Use those in the "Get Token" tab of this app
+
+The app will POST to `/rest/oauth/token` using the standard OAuth2 Client Credentials grant.
+
+## Important Notes
+
+**CORS**: Because this is a pure client-side WASM app, your browser makes direct calls to your Jama instance. 
+
+- If your Jama is on `jamacloud.com` or properly configured, it may work.
+- Many on-prem or strict instances block browser CORS requests.
+- For production/internal tools, the recommended pattern is to add a small Rust backend (Axum) that proxies the Jama calls and handles authentication.
+
+This demo is intentionally simple so you can quickly test the API and then extend it.
+
 ## Project Structure
 
 ```
-leptos-microsoft-saml-hello/
 ├── Cargo.toml
 ├── Trunk.toml
 ├── index.html
+├── justfile
 ├── README.md
 └── src/
-    └── lib.rs
+    └── lib.rs          # All the Leptos UI + API logic
 ```
 
-## How the Auth Flow Works in This Sample
+## Available `just` commands
 
-1. **Login button** redirects the browser to your Microsoft Entra ID SAML endpoint (`https://login.microsoftonline.com/{tenant}/saml2`).
+```bash
+just                    # Show all recipes
+just install-tools      # Install trunk + wasm target
+just serve              # Start dev server with hot reload
+just build              # Production build to dist/
+just check
+just fmt
+just clean
+```
 
-2. User authenticates at Microsoft.
+## Next Steps / Ideas
 
-3. Microsoft POSTs the `SAMLResponse` (base64 encoded assertion) to your configured **Reply URL (ACS)**.
+- Add more endpoints (items, relationships, test runs, etc.)
+- Add token refresh logic
+- Persist Client ID/Secret in localStorage (optional)
+- Add a small Axum backend proxy for CORS + token security
+- Switch to `leptos_router` for multiple pages
 
-4. **In this pure WASM demo**: The simulate button sets a mock user. In a real setup you would:
-   - Have a backend receive the POST at e.g. `/saml/acs`
-   - Validate the assertion using a SAML library (or delegate)
-   - Create a short-lived JWT or session
-   - Redirect back to the SPA with the token (e.g. `/#token=xxx` or query param, or HttpOnly cookie)
-   - Leptos app reads the token on load and fetches user info (or decodes claims)
-
-## Configuring Microsoft Entra ID (SAML)
-
-1. Microsoft Entra admin center → **Enterprise applications** → **New application** → **Create your own application**
-   - Name: `Leptos SAML Demo`
-   - Integration: Non-gallery
-
-2. Go to the app → **Single sign-on** → **SAML**
-
-3. **Basic SAML Configuration**:
-   - **Identifier (Entity ID)**: `urn:leptos-saml-demo:sp` (or your domain)
-   - **Reply URL (Assertion Consumer Service URL)**: `https://your-app.example.com/` (or `https://localhost:3000/` for dev — note browsers block mixed content; use HTTPS in prod or tunnel)
-   - **Sign on URL**: `https://your-app.example.com/`
-
-4. **Attributes & Claims** (default is usually fine):
-   - `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/nameidentifier` → User.ObjectID or UPN
-   - Add `emailaddress`, `givenname`, `surname`, `upn` etc. as needed
-
-5. Note the **Login URL** and **Azure AD Identifier** from the setup screen. Update the constants in `src/lib.rs`.
-
-6. **Users and groups** → Assign yourself or test users.
-
-7. For production, upload your app's certificate if you want signed AuthnRequests, and configure the IdP certificate for response validation (done on backend).
-
-## Important Production Notes
-
-- **Never validate SAML assertions in the browser.** The signature verification, audience check, NotOnOrAfter, etc. must happen server-side.
-- Use **HTTP-Only, Secure cookies** or short-lived JWTs for session management.
-- Consider using **OIDC** (Authorization Code + PKCE) instead of SAML for pure SPAs — Microsoft strongly supports it and there are simpler flows (though you asked for SAML).
-- For GovCloud / GCC High (common in your environment), the endpoints are `login.microsoftonline.us` or specific GCC URLs.
-- Add proper error handling, token refresh, and logout (SAML SLO is complex; often just local logout + redirect to Microsoft logout URL).
-
-## Extending This Sample
-
-- Add `leptos_router` for proper `/login`, `/callback` routes.
-- Add a real backend with `axum` + a SAML crate (e.g. community `saml2` or implement basic validation).
-- Persist a real token from your backend instead of the mock `UserInfo`.
-- Use `web-sys` + `js_sys` to read `SAMLResponse` if you proxy the ACS through a service worker or small server that injects it.
-- Style with real Tailwind (add `tailwind.config.js` and trunk pipeline) instead of the CDN used here for demo.
-
-## License / Usage
-
-Free to use and adapt for your internal tools. Customize the `UserInfo` struct to match the claims you map in Entra ID.
-
-Happy coding with Leptos + Rust WASM! 🦀
+Built with ❤️ using Leptos, Rust, and Tailwind.

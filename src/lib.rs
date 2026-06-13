@@ -1,304 +1,434 @@
-use leptos::prelude::*;
-use wasm_bindgen::prelude::*;
-use web_sys::{window, Storage};
+use leptos::*;
+use leptos::ev::event_target_value;
+use gloo_net::http::Request;
+use serde::{Deserialize, Serialize};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+use wasm_bindgen_futures::spawn_local;
 
-/// User information extracted from SAML assertion (or JWT claims in production).
-/// Extend this struct with fields that match the claims you configure in Entra ID
-/// (e.g. http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress, name, etc.)
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UserInfo {
-    pub display_name: String,
-    pub email: String,
-    pub upn: String,
-    pub object_id: Option<String>,
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Project {
+    id: Option<i64>,
+    projectKey: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    status: Option<String>,
 }
 
-/// Configuration - UPDATE THESE VALUES for your Microsoft Entra ID tenant/app
-const TENANT_ID: &str = "YOUR_TENANT_ID_OR_DOMAIN"; // e.g. "contoso.onmicrosoft.com" or a GUID
-const ENTITY_ID: &str = "urn:leptos-saml-demo:sp";   // Must match what you configured in Entra ID
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ProjectsResponse {
+    data: Vec<Project>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    token_type: Option<String>,
+    expires_in: Option<i64>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    UseToken,
+    GetToken,
+}
 
 #[component]
 pub fn App() -> impl IntoView {
-    // Reactive auth state
-    let (user, set_user) = signal::<Option<UserInfo>>(None);
-    let (auth_error, set_auth_error) = signal::<Option<String>>(None);
-    let (is_loading, set_is_loading) = signal(false);
+    // State
+    let (current_tab, set_current_tab) = create_signal(Tab::UseToken);
+    let (base_url, set_base_url) = create_signal(String::from("https://yourcompany.jamacloud.com"));
+    let (token, set_token) = create_signal(String::new());
+    let (client_id, set_client_id) = create_signal(String::new());
+    let (client_secret, set_client_secret) = create_signal(String::new());
+    
+    let (projects, set_projects) = create_signal(Vec::<Project>::new());
+    let (is_loading, set_is_loading) = create_signal(false);
+    let (error, set_error) = create_signal(Option::<String>::None);
+    let (success_msg, set_success_msg) = create_signal(Option::<String>::None);
 
-    // Check for existing session on mount (localStorage in this demo)
-    Effect::new(move |_| {
-        if let Some(storage) = get_local_storage() {
-            if let Ok(Some(stored_json)) = storage.get_item("saml_demo_user") {
-                // In a real app you'd validate a JWT here instead of trusting localStorage
-                if let Some(parsed) = parse_mock_user(&stored_json) {
-                    set_user.set(Some(parsed));
+    let has_token = move || !token.get().trim().is_empty();
+
+    // Fetch projects using current token
+    let fetch_projects = move |_| {
+        let base = base_url.get().trim_end_matches('/').to_string();
+        let auth_token = token.get();
+
+        if auth_token.trim().is_empty() {
+            set_error.set(Some("Please enter a bearer token first.".to_string()));
+            return;
+        }
+
+        set_is_loading.set(true);
+        set_error.set(None);
+        set_success_msg.set(None);
+        set_projects.set(vec![]);
+
+        spawn_local(async move {
+            let url = format!("{}/rest/v1/projects", base);
+
+            match Request::get(&url)
+                .header("Authorization", &format!("Bearer {}", auth_token))
+                .header("Accept", "application/json")
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    if resp.ok() {
+                        match resp.json::<ProjectsResponse>().await {
+                            Ok(data) => {
+                                set_projects.set(data.data);
+                                set_success_msg.set(Some(format!("Loaded {} projects", data.data.len())));
+                            }
+                            Err(e) => {
+                                set_error.set(Some(format!("Failed to parse projects: {}", e)));
+                            }
+                        }
+                    } else {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        set_error.set(Some(format!("Jama API error ({}): {}", status, text)));
+                    }
+                }
+                Err(e) => {
+                    set_error.set(Some(format!("Network error: {}. Make sure the Jama URL is correct and CORS is allowed.", e)));
                 }
             }
-        }
-    });
+            set_is_loading.set(false);
+        });
+    };
 
-    // Initiate SP-initiated SAML login (or IdP-initiated via the Login URL)
-    let start_saml_login = move |_| {
+    // Get token using Client Credentials
+    let get_token = move |_| {
+        let base = base_url.get().trim_end_matches('/').to_string();
+        let cid = client_id.get();
+        let secret = client_secret.get();
+
+        if cid.trim().is_empty() || secret.trim().is_empty() {
+            set_error.set(Some("Please enter both Client ID and Client Secret.".to_string()));
+            return;
+        }
+
         set_is_loading.set(true);
-        set_auth_error.set(None);
+        set_error.set(None);
+        set_success_msg.set(None);
 
-        // Build the Microsoft SAML endpoint.
-        // For a full SP-initiated flow you would also generate a SAMLRequest (AuthnRequest XML,
-        // deflate + base64). For this hello world we redirect to the tenant's SAML endpoint.
-        // Many organizations use the "Login URL" shown in Entra ID SSO setup directly.
-        let login_url = if TENANT_ID == "YOUR_TENANT_ID_OR_DOMAIN" {
-            // Fallback demo URL (will show Microsoft login page but may not work without config)
-            "https://login.microsoftonline.com/common/saml2".to_string()
-        } else {
-            format!("https://login.microsoftonline.com/{}/saml2", TENANT_ID)
-        };
+        spawn_local(async move {
+            let url = format!("{}/rest/oauth/token", base);
+            let basic = format!("{}:{}", cid, secret);
+            let basic_b64 = BASE64.encode(basic.as_bytes());
 
-        if let Some(w) = window() {
-            // In production you might want to set RelayState to return to current page or a specific route
-            let _ = w.location().set_href(&login_url);
-        }
-        set_is_loading.set(false);
+            let body = "grant_type=client_credentials";
+
+            match Request::post(&url)
+                .header("Authorization", &format!("Basic {}", basic_b64))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    if resp.ok() {
+                        match resp.json::<TokenResponse>().await {
+                            Ok(token_resp) => {
+                                set_token.set(token_resp.access_token.clone());
+                                set_success_msg.set(Some("Successfully obtained access token!".to_string()));
+                                // Switch to Use Token tab and show projects hint
+                                set_current_tab.set(Tab::UseToken);
+                            }
+                            Err(e) => {
+                                set_error.set(Some(format!("Failed to parse token response: {}", e)));
+                            }
+                        }
+                    } else {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        set_error.set(Some(format!("Token request failed ({}): {}", status, text)));
+                    }
+                }
+                Err(e) => {
+                    set_error.set(Some(format!("Network error getting token: {}. Check your Jama URL.", e)));
+                }
+            }
+            set_is_loading.set(false);
+        });
     };
 
-    // Simulate a successful SAML callback (useful for demo without full backend)
-    // In production this would be replaced by reading a JWT from URL/cookie after backend validation
-    let simulate_successful_login = move |_| {
-        set_is_loading.set(true);
-        set_auth_error.set(None);
-
-        let mock_user = UserInfo {
-            display_name: "Thomas Rizzo".to_string(),
-            email: "thomas.rizzo@contoso.com".to_string(),
-            upn: "thomas.rizzo@contoso.com".to_string(),
-            object_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
-        };
-
-        // Persist in localStorage (demo only — use secure HttpOnly cookie or validated JWT in prod)
-        if let Some(storage) = get_local_storage() {
-            let json = format!(
-                r#"{{"display_name":"{}","email":"{}","upn":"{}","object_id":"{}"}}"#,
-                mock_user.display_name,
-                mock_user.email,
-                mock_user.upn,
-                mock_user.object_id.as_deref().unwrap_or("")
-            );
-            let _ = storage.set_item("saml_demo_user", &json);
-        }
-
-        set_user.set(Some(mock_user));
-        set_is_loading.set(false);
-    };
-
-    let logout = move |_| {
-        if let Some(storage) = get_local_storage() {
-            let _ = storage.remove_item("saml_demo_user");
-        }
-        set_user.set(None);
-        set_auth_error.set(None);
-        
-        // Optional: Redirect to Microsoft logout for full SLO experience
-        // let logout_url = format!("https://login.microsoftonline.com/{}/oauth2/v2.0/logout", TENANT_ID);
-        // if let Some(w) = window() { let _ = w.location().set_href(&logout_url); }
-    };
-
-    // Clear any error when user interacts
-    let clear_error = move |_| {
-        set_auth_error.set(None);
+    let clear_all = move |_| {
+        set_token.set(String::new());
+        set_projects.set(vec![]);
+        set_error.set(None);
+        set_success_msg.set(None);
+        set_client_id.set(String::new());
+        set_client_secret.set(String::new());
     };
 
     view! {
-        <div class="min-h-screen bg-zinc-950 flex flex-col">
-            {/* Top nav */}
-            <nav class="border-b border-zinc-800 bg-zinc-900/50 backdrop-blur-lg sticky top-0 z-50">
-                <div class="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
+        <div class="min-h-screen bg-slate-50">
+            // Top nav
+            <nav class="border-b bg-white">
+                <div class="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
                     <div class="flex items-center gap-x-3">
-                        <div class="w-9 h-9 bg-blue-600 rounded-2xl flex items-center justify-center shadow-inner">
-                            <span class="text-white text-2xl font-bold tracking-tighter">L</span>
+                        <div class="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center">
+                            <i class="fa-solid fa-plug text-white text-2xl"></i>
                         </div>
                         <div>
-                            <div class="font-semibold text-xl tracking-tight">"Leptos SAML"</div>
-                            <div class="text-[10px] text-zinc-500 -mt-1">"Hello World Demo"</div>
+                            <h1 class="font-display text-2xl tracking-tight text-slate-900">Jama Connect</h1>
+                            <p class="text-xs text-slate-500 -mt-1">Explorer • Leptos + WASM</p>
                         </div>
                     </div>
                     
                     <div class="flex items-center gap-x-2 text-sm">
-                        <div class="px-3 py-1 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-400 text-xs font-mono">
-                            "Rust • WASM • Trunk"
+                        <div class="px-3 py-1.5 bg-slate-100 rounded-full text-slate-600 flex items-center gap-x-2">
+                            <i class="fa-solid fa-globe fa-sm"></i>
+                            <span class="font-mono text-xs">{move || base_url.get()}</span>
                         </div>
-                        {move || if user.get().is_some() {
-                            view! { <div class="px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-medium border border-emerald-500/20">"Authenticated"</div> }.into_any()
+                        {move || if has_token() {
+                            view! { <div class="px-3 py-1 bg-emerald-100 text-emerald-700 rounded-full text-xs font-medium flex items-center gap-x-1.5">
+                                <i class="fa-solid fa-check-circle"></i>
+                                <span>Authenticated</span>
+                            </div> }
                         } else {
-                            view! { <div></div> }.into_any()
+                            view! { <div></div> }
                         }}
                     </div>
                 </div>
             </nav>
 
-            <div class="flex-1 flex items-center justify-center p-6">
-                <div class="w-full max-w-lg">
-                    {/* Header */}
-                    <div class="text-center mb-10">
-                        <div class="inline-flex items-center gap-x-2 px-4 py-1.5 rounded-3xl bg-zinc-900 border border-zinc-800 mb-6">
-                            <div class="w-2 h-2 bg-emerald-400 rounded-full animate-pulse"></div>
-                            <span class="text-xs font-medium tracking-[2px] text-zinc-400">"MICROSOFT ENTRA ID • SAML 2.0"</span>
-                        </div>
+            <div class="max-w-5xl mx-auto px-6 py-8">
+                // Header
+                <div class="mb-8">
+                    <h2 class="text-3xl font-semibold tracking-tight text-slate-900">REST API Explorer</h2>
+                    <p class="mt-2 text-slate-600 max-w-md">
+                        Connect to your Jama instance and explore projects using OAuth or a bearer token.
+                    </p>
+                </div>
+
+                // Authentication Card
+                <div class="leptos-card bg-white border border-slate-200 rounded-3xl shadow-sm overflow-hidden mb-8">
+                    <div class="px-6 pt-6 pb-4 border-b flex items-center justify-between bg-slate-50/50">
+                        <div class="section-header">Authentication</div>
                         
-                        <h1 class="text-6xl font-semibold tracking-tighter text-white mb-3">
-                            "Hello, World."
-                        </h1>
-                        <p class="text-xl text-zinc-400 max-w-sm mx-auto">
-                            "A minimal Leptos + WASM app authenticating against your organization's Microsoft SAML."
-                        </p>
+                        <button 
+                            on:click=clear_all
+                            class="text-xs px-3 py-1.5 hover:bg-slate-100 rounded-xl text-slate-500 hover:text-slate-700 flex items-center gap-x-2 transition-colors"
+                        >
+                            <i class="fa-solid fa-undo fa-sm"></i>
+                            <span>Clear</span>
+                        </button>
                     </div>
 
-                    {/* Main Card */}
-                    <div class="bg-zinc-900 border border-zinc-800 rounded-3xl p-8 shadow-2xl">
-                        {move || match (user.get(), is_loading.get()) {
-                            (Some(u), false) => view! {
-                                <div class="space-y-8">
-                                    {/* User Info Section */}
+                    // Tabs
+                    <div class="flex border-b px-6">
+                        <button 
+                            class=move || format!("px-5 py-3 text-sm font-medium transition-colors {}", 
+                                if current_tab.get() == Tab::UseToken { "tab-active text-blue-700" } else { "text-slate-500 hover:text-slate-700" })
+                            on:click=move |_| set_current_tab.set(Tab::UseToken)
+                        >
+                            <i class="fa-solid fa-key mr-2"></i>
+                            Use Existing Token
+                        </button>
+                        <button 
+                            class=move || format!("px-5 py-3 text-sm font-medium transition-colors {}", 
+                                if current_tab.get() == Tab::GetToken { "tab-active text-blue-700" } else { "text-slate-500 hover:text-slate-700" })
+                            on:click=move |_| set_current_tab.set(Tab::GetToken)
+                        >
+                            <i class="fa-solid fa-magic mr-2"></i>
+                            Get Token (Client ID + Secret)
+                        </button>
+                    </div>
+
+                    <div class="p-6">
+                        // Base URL (common to both)
+                        <div class="mb-5">
+                            <label class="block text-xs font-semibold tracking-wider text-slate-500 mb-1.5">JAMA BASE URL</label>
+                            <input 
+                                type="text"
+                                class="w-full px-4 py-3 border border-slate-300 rounded-2xl text-sm focus:outline-none focus:border-blue-500 font-mono"
+                                placeholder="https://yourcompany.jamacloud.com"
+                                prop:value=base_url
+                                on:input=move |ev| set_base_url.set(event_target_value(&ev))
+                            />
+                            <p class="mt-1.5 text-[10px] text-slate-400">Include https:// and no trailing slash</p>
+                        </div>
+
+                        // Tab content
+                        {move || match current_tab.get() {
+                            Tab::UseToken => view! {
+                                <div>
                                     <div>
-                                        <div class="flex items-center gap-x-4 mb-6">
-                                            <div class="w-14 h-14 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-2xl flex-shrink-0 flex items-center justify-center text-3xl shadow-inner">
-                                                "👤"
-                                            </div>
-                                            <div class="min-w-0">
-                                                <div class="font-semibold text-2xl tracking-tight text-white truncate">{u.display_name.clone()}</div>
-                                                <div class="text-emerald-400 text-sm font-medium">"Signed in via SAML"</div>
-                                            </div>
-                                        </div>
-
-                                        <div class="bg-zinc-950 border border-zinc-800 rounded-2xl p-5 space-y-4 text-sm">
-                                            <div class="flex justify-between items-center py-1 border-b border-zinc-800">
-                                                <span class="text-zinc-400">"Email / UPN"</span>
-                                                <span class="font-mono text-white truncate max-w-[220px] text-right">{u.email.clone()}</span>
-                                            </div>
-                                            <div class="flex justify-between items-center py-1 border-b border-zinc-800">
-                                                <span class="text-zinc-400">"User Principal Name"</span>
-                                                <span class="font-mono text-white truncate max-w-[220px] text-right">{u.upn.clone()}</span>
-                                            </div>
-                                            {u.object_id.as_ref().map(|oid| view! {
-                                                <div class="flex justify-between items-center py-1">
-                                                    <span class="text-zinc-400">"Object ID"</span>
-                                                    <span class="font-mono text-white text-xs truncate max-w-[220px] text-right">{oid.clone()}</span>
-                                                </div>
-                                            })}
-                                        </div>
+                                        <label class="block text-xs font-semibold tracking-wider text-slate-500 mb-1.5">BEARER TOKEN</label>
+                                        <input 
+                                            type="password"
+                                            class="w-full px-4 py-3 border border-slate-300 rounded-2xl text-sm focus:outline-none focus:border-blue-500 font-mono"
+                                            placeholder="Paste your Jama access token here"
+                                            prop:value=token
+                                            on:input=move |ev| set_token.set(event_target_value(&ev))
+                                        />
                                     </div>
-
-                                    <button
-                                        on:click=logout
-                                        class="w-full py-4 text-base font-semibold bg-zinc-800 hover:bg-red-600/90 active:bg-red-700 transition-all rounded-2xl border border-zinc-700 hover:border-red-500/50 text-white flex items-center justify-center gap-x-2"
-                                    >
-                                        <span>"Sign out of Microsoft"</span>
-                                    </button>
                                 </div>
-                            }.into_any(),
-
-                            (None, false) => view! {
-                                <div class="space-y-6">
-                                    <div class="text-center py-4">
-                                        <p class="text-zinc-400 text-[15px] leading-relaxed max-w-[300px] mx-auto">
-                                            "Click below to start the SAML authentication flow with your Microsoft Entra ID tenant."
-                                        </p>
+                            }.into_view(),
+                            
+                            Tab::GetToken => view! {
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label class="block text-xs font-semibold tracking-wider text-slate-500 mb-1.5">CLIENT ID</label>
+                                        <input 
+                                            type="text"
+                                            class="w-full px-4 py-3 border border-slate-300 rounded-2xl text-sm focus:outline-none focus:border-blue-500 font-mono"
+                                            placeholder="your-client-id"
+                                            prop:value=client_id
+                                            on:input=move |ev| set_client_id.set(event_target_value(&ev))
+                                        />
                                     </div>
-
-                                    <button
-                                        on:click=start_saml_login
-                                        disabled=move || TENANT_ID == "YOUR_TENANT_ID_OR_DOMAIN"
-                                        class="w-full group py-5 text-lg font-semibold bg-white text-zinc-950 hover:bg-zinc-100 active:bg-zinc-200 transition-all rounded-2xl flex items-center justify-center gap-x-3 disabled:opacity-40 disabled:cursor-not-allowed shadow-xl"
-                                    >
-                                        <span class="text-xl">"🔐"</span>
-                                        <span>"Continue with Microsoft"</span>
-                                    </button>
-
-                                    <div class="text-center">
-                                        <button
-                                            on:click=simulate_successful_login
-                                            class="text-xs text-zinc-500 hover:text-zinc-300 underline underline-offset-4 transition-colors"
-                                        >
-                                            "Demo mode: Simulate successful SAML response"
-                                        </button>
+                                    <div>
+                                        <label class="block text-xs font-semibold tracking-wider text-slate-500 mb-1.5">CLIENT SECRET</label>
+                                        <input 
+                                            type="password"
+                                            class="w-full px-4 py-3 border border-slate-300 rounded-2xl text-sm focus:outline-none focus:border-blue-500 font-mono"
+                                            placeholder="••••••••••••"
+                                            prop:value=client_secret
+                                            on:input=move |ev| set_client_secret.set(event_target_value(&ev))
+                                        />
                                     </div>
-
-                                    {move || if TENANT_ID == "YOUR_TENANT_ID_OR_DOMAIN" {
-                                        view! {
-                                            <div class="text-[10px] text-amber-400/70 text-center px-4">
-                                                "⚠️ Update <code class=\"font-mono\">TENANT_ID</code> in src/lib.rs with your Entra tenant"
-                                            </div>
-                                        }.into_any()
-                                    } else { view! { <div></div> }.into_any() }}
                                 </div>
-                            }.into_any(),
-
-                            (_, true) => view! {
-                                <div class="flex flex-col items-center justify-center py-12">
-                                    <div class="w-8 h-8 border-2 border-white/30 border-t-white rounded-full animate-spin mb-4"></div>
-                                    <p class="text-sm text-zinc-400">"Redirecting to Microsoft..."</p>
-                                </div>
-                            }.into_any()
+                            }.into_view(),
                         }}
 
-                        {/* Error display */}
-                        {move || auth_error.get().map(|err| view! {
-                            <div 
-                                on:click=clear_error
-                                class="mt-6 p-4 bg-red-950/60 border border-red-900/50 text-red-400 text-sm rounded-2xl cursor-pointer hover:bg-red-950/80 transition-colors"
-                            >
-                                {err}
-                                <div class="text-[10px] mt-1 text-red-500/70">"Click to dismiss"</div>
-                            </div>
-                        })}
-                    </div>
+                        // Action buttons
+                        <div class="mt-6 flex items-center gap-x-3">
+                            {move || if current_tab.get() == Tab::GetToken {
+                                view! {
+                                    <button 
+                                        on:click=get_token
+                                        disabled=move || is_loading.get()
+                                        class="flex-1 md:flex-none px-8 py-3.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 transition-colors text-white rounded-2xl font-semibold text-sm flex items-center justify-center gap-x-2 shadow-sm"
+                                    >
+                                        {move || if is_loading.get() { 
+                                            view! { <><i class="fa-solid fa-spinner fa-spin mr-2"></i> Getting Token... </> }
+                                        } else { 
+                                            view! { <><i class="fa-solid fa-key mr-2"></i> Get Access Token </> }
+                                        }}
+                                    </button>
+                                }.into_view()
+                            } else {
+                                view! { <div></div> }.into_view()
+                            }}
 
-                    {/* Footer info */}
-                    <div class="mt-8 text-center text-[10px] text-zinc-500 font-mono tracking-widest">
-                        "CSR MODE • LEPTOS 0.8 • TRUNK • WASM32"
+                            <button 
+                                on:click=fetch_projects
+                                disabled=move || is_loading.get() || !has_token()
+                                class="flex-1 md:flex-none px-8 py-3.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-300 transition-colors text-white rounded-2xl font-semibold text-sm flex items-center justify-center gap-x-2 shadow-sm"
+                            >
+                                {move || if is_loading.get() { 
+                                    view! { <><i class="fa-solid fa-spinner fa-spin mr-2"></i> Loading... </> }
+                                } else { 
+                                    view! { <><i class="fa-solid fa-sync mr-2"></i> Fetch Projects </> }
+                                }}
+                            </button>
+                        </div>
                     </div>
                 </div>
+
+                // Status / Error / Success
+                {move || error.get().map(|e| view! {
+                    <div class="mb-6 px-5 py-4 bg-red-50 border border-red-200 text-red-700 rounded-2xl flex gap-x-3 text-sm">
+                        <i class="fa-solid fa-exclamation-triangle mt-0.5"></i>
+                        <div>{e}</div>
+                    </div>
+                })}
+
+                {move || success_msg.get().map(|msg| view! {
+                    <div class="mb-6 px-5 py-4 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-2xl flex gap-x-3 text-sm">
+                        <i class="fa-solid fa-check-circle mt-0.5"></i>
+                        <div>{msg}</div>
+                    </div>
+                })}
+
+                // Projects section
+                {move || if !projects.get().is_empty() {
+                    view! {
+                        <div class="leptos-card bg-white border border-slate-200 rounded-3xl shadow-sm overflow-hidden">
+                            <div class="px-6 py-4 border-b flex items-center justify-between bg-slate-50/50">
+                                <div>
+                                    <div class="section-header">Projects</div>
+                                    <div class="text-xs text-slate-400 mt-0.5">{projects.get().len()} projects found</div>
+                                </div>
+                                <button 
+                                    on:click=fetch_projects
+                                    class="text-xs px-4 py-2 hover:bg-white border border-slate-200 rounded-xl flex items-center gap-x-2 text-slate-600 hover:text-slate-900 transition-colors"
+                                >
+                                    <i class="fa-solid fa-sync fa-sm"></i>
+                                    <span>Refresh</span>
+                                </button>
+                            </div>
+
+                            <div class="divide-y">
+                                <For
+                                    each=projects
+                                    key=|p| p.id.unwrap_or(0)
+                                    children=move |project| {
+                                        view! {
+                                            <div class="project-card px-6 py-5 flex items-start gap-x-4 hover:bg-slate-50/60">
+                                                <div class="w-9 h-9 mt-0.5 flex-shrink-0 bg-blue-100 text-blue-600 rounded-2xl flex items-center justify-center">
+                                                    <i class="fa-solid fa-folder fa-lg"></i>
+                                                </div>
+                                                <div class="flex-1 min-w-0">
+                                                    <div class="flex items-center gap-x-3">
+                                                        <div class="font-semibold text-lg tracking-tight text-slate-900">
+                                                            {project.name.clone().unwrap_or_else(|| "Unnamed".to_string())}
+                                                        </div>
+                                                        {project.projectKey.as_ref().map(|key| view! {
+                                                            <div class="font-mono text-xs px-2.5 py-0.5 bg-slate-100 text-slate-500 rounded-lg">{key.clone()}</div>
+                                                        })}
+                                                        {project.status.as_ref().map(|s| view! {
+                                                            <div class=move || format!("text-[10px] px-2 py-px rounded font-medium tracking-wider {}",
+                                                                if s.to_uppercase() == "ACTIVE" { "bg-emerald-100 text-emerald-600" } else { "bg-slate-100 text-slate-500" }
+                                                            )>
+                                                                {s.clone()}
+                                                            </div>
+                                                        })}
+                                                    </div>
+                                                    
+                                                    {project.description.as_ref().map(|desc| view! {
+                                                        <div class="text-sm text-slate-600 mt-1.5 line-clamp-2 pr-8">{desc.clone()}</div>
+                                                    })}
+                                                    
+                                                    <div class="mt-3 flex items-center gap-x-4 text-xs text-slate-400">
+                                                        <div class="font-mono">ID: {project.id.unwrap_or(0)}</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        }
+                                    }
+                                />
+                            </div>
+                        </div>
+                    }.into_view()
+                } else if has_token() && !is_loading.get() {
+                    view! {
+                        <div class="text-center py-10 px-6 bg-white border border-dashed border-slate-200 rounded-3xl">
+                            <i class="fa-solid fa-folder-open text-4xl text-slate-300 mb-4"></i>
+                            <p class="text-slate-500">Click \"Fetch Projects\" to load your Jama projects.</p>
+                        </div>
+                    }.into_view()
+                } else {
+                    view! { <div></div> }.into_view()
+                }}
+            </div>
+
+            // Footer note
+            <div class="max-w-5xl mx-auto px-6 pb-12 text-center">
+                <p class="text-[10px] text-slate-400">
+                    This is a client-side Leptos demo. For production use, consider a backend proxy to avoid CORS issues.
+                </p>
             </div>
         </div>
     }
 }
 
-/// Helper to get localStorage safely
-fn get_local_storage() -> Option<Storage> {
-    window()
-        .and_then(|w| w.local_storage().ok())
-        .flatten()
-}
-
-/// Very simple mock parser for the demo persisted JSON.
-/// In production you would decode + validate a real JWT.
-fn parse_mock_user(json: &str) -> Option<UserInfo> {
-    // Extremely naive parsing for demo purposes only
-    if json.contains("display_name") && json.contains("email") {
-        Some(UserInfo {
-            display_name: extract_json_string(json, "display_name").unwrap_or("Demo User".into()),
-            email: extract_json_string(json, "email").unwrap_or("demo@example.com".into()),
-            upn: extract_json_string(json, "upn").unwrap_or("demo@example.com".into()),
-            object_id: extract_json_string(json, "object_id"),
-        })
-    } else {
-        None
-    }
-}
-
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\":\"", key);
-    if let Some(start) = json.find(&pattern) {
-        let value_start = start + pattern.len();
-        if let Some(end) = json[value_start..].find('"') {
-            return Some(json[value_start..value_start + end].to_string());
-        }
-    }
-    None
-}
-
-/// WASM entry point
-#[wasm_bindgen(start)]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn main() {
     console_error_panic_hook::set_once();
-    
-    // Mount the Leptos app to the body (or a specific element)
-    mount_to_body(App);
+    leptos::mount::mount_to_body(App);
 }
