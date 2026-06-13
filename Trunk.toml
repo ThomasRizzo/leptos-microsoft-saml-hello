@@ -1,0 +1,10 @@
+[build]
+# The HTML entry point
+target = "index.html"
+
+# Optional: assets to copy
+# assets = ["public"]
+
+[watch]
+# Watch additional files
+watch = ["src", "index.html", "Cargo.toml"]
