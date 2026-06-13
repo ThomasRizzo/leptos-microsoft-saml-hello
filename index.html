@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Leptos SAML Hello • Microsoft Entra ID</title>
+    
+    <!-- Tailwind via CDN for beautiful demo UI (replace with proper build in production) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        'sans': ['Inter', 'system-ui', 'sans-serif']
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- Trunk will inject the WASM/JS bundle here -->
+    <link data-trunk rel="rust" href="Cargo.toml" />
+</head>
+<body class="bg-zinc-950 text-zinc-200">
+    <!-- The Leptos app mounts here -->
+    <div id="app"></div>
+    
+    <!-- Fallback / loading indicator -->
+    <noscript>
+        <div class="flex items-center justify-center min-h-screen">
+            <p class="text-red-400">This app requires JavaScript (WASM) to run.</p>
+        </div>
+    </noscript>
+</body>
+</html>
